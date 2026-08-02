@@ -10,7 +10,7 @@ const DISCORD_CHANNEL_IDS = process.env.DISCORD_CHANNEL_IDS
   : [];
 const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || 'http://localhost:11434';
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'llava';
-const OLLAMA_PROMPT = process.env.OLLAMA_PROMT || process.env.OLLAMA_PROMPT || 'Describe this image in bullet points.';
+const OLLAMA_PROMPT = process.env.OLLAMA_PROMPT || 'Describe this image in bullet points.';
 
 if (!DISCORD_BOT_TOKEN) {
   console.error("ERROR: DISCORD_BOT_TOKEN is required.");
