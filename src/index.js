@@ -31,7 +31,7 @@ console.log(`Ollama Base URL: ${OLLAMA_BASE_URL}`);
 console.log(`Ollama Model: ${OLLAMA_MODEL}`);
 console.log(`Ollama Prompt: ${OLLAMA_PROMPT}`);
 
-// In-Memory Queue implementation
+// In-Memory Queue for Ollama requests (sequential to avoid concurrent GPU thrashing)
 class TaskQueue {
   constructor() {
     this.queue = [];
@@ -64,7 +64,7 @@ class TaskQueue {
 
 const taggerQueue = new TaskQueue();
 
-// Helper function to split long messages into chunks under 1800 characters
+// Helper: split long messages into chunks under maxLength characters
 function splitMessage(text, maxLength = 1800) {
   if (text.length <= maxLength) return [text];
   const chunks = [];
@@ -98,14 +98,112 @@ function splitMessage(text, maxLength = 1800) {
   return chunks;
 }
 
-// Extract the first uninterrupted numeric ID from an image filename.
+// Helper: extract the first uninterrupted numeric ID (4+ digits) from an image filename.
 // Handles filenames like "12345.png", "12345-67890.png", "prefix_12345.jpg", etc.
 function extractImageId(filename) {
-  // Strip the extension first
   const nameWithoutExt = filename.replace(/\.[^.]+$/, '');
-  // Match the first run of digits that is at least 4 digits long (to avoid trivial matches)
   const match = nameWithoutExt.match(/(\d{4,})/);
   return match ? match[1] : null;
+}
+
+// Helper: fetch the starter message for a thread, retrying up to 5 times
+async function fetchStarterMessageWithRetry(thread) {
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      const msg = await thread.fetchStarterMessage();
+      if (msg) return msg;
+    } catch (err) {
+      console.log(`[Attempt ${attempt}/5] Failed to fetch starter message for "${thread.name}": ${err.message}`);
+    }
+    await new Promise(resolve => setTimeout(resolve, 2000));
+  }
+  return null;
+}
+
+// Immediately rename a thread if an image ID is detected in any attachment filename
+async function renameThreadWithId(thread, imageAttachments) {
+  let detectedId = null;
+  for (const [_, attachment] of imageAttachments) {
+    detectedId = extractImageId(attachment.name);
+    if (detectedId) break;
+  }
+
+  if (!detectedId) return;
+
+  const originalTitle = thread.name;
+  const newTitle = `${detectedId} - ${originalTitle}`;
+  console.log(`Renaming thread to: "${newTitle}"`);
+  try {
+    await thread.setName(newTitle);
+  } catch (err) {
+    console.warn(`Could not rename thread "${thread.name}": ${err.message}`);
+  }
+}
+
+// Run Ollama image description and post results to the thread
+async function describeAndReply(thread, imageAttachments) {
+  let typingInterval = null;
+  try {
+    // Start typing indicator and keep it alive during the Ollama request
+    await thread.sendTyping().catch(err => console.warn(`Failed to send typing indicator: ${err.message}`));
+    typingInterval = setInterval(() => {
+      thread.sendTyping().catch(err => console.warn(`Failed to send typing indicator: ${err.message}`));
+    }, 5000);
+
+    // Convert images to base64
+    const base64Images = [];
+    for (const [_, attachment] of imageAttachments) {
+      try {
+        const res = await fetch(attachment.url);
+        if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+        const buffer = await res.arrayBuffer();
+        base64Images.push(Buffer.from(buffer).toString('base64'));
+      } catch (err) {
+        console.error(`Failed to download image ${attachment.name}:`, err.message);
+      }
+    }
+
+    if (base64Images.length === 0) {
+      console.error(`Failed to download any images for thread "${thread.name}". Skipping Ollama.`);
+      return;
+    }
+
+    // Query Ollama
+    console.log(`Sending ${base64Images.length} image(s) to Ollama (${OLLAMA_MODEL})...`);
+    const ollamaResponse = await fetch(`${OLLAMA_BASE_URL}/api/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: OLLAMA_MODEL,
+        prompt: OLLAMA_PROMPT,
+        images: base64Images,
+        stream: false,
+        keep_alive: 0,
+      }),
+    });
+
+    if (!ollamaResponse.ok) {
+      throw new Error(`Ollama API returned HTTP ${ollamaResponse.status}`);
+    }
+
+    const responseData = await ollamaResponse.json();
+    const description = responseData.response;
+
+    if (!description) {
+      throw new Error("Empty description returned from Ollama API");
+    }
+
+    // Post description back to the forum thread, split into ≤1800-char chunks
+    const messageChunks = splitMessage(description, 1800);
+    for (const chunk of messageChunks) {
+      await thread.send(chunk);
+    }
+    console.log(`Replied to "${thread.name}" with ${messageChunks.length} message(s).`);
+  } catch (error) {
+    console.error(`Error describing images in thread "${thread.name}":`, error);
+  } finally {
+    if (typingInterval) clearInterval(typingInterval);
+  }
 }
 
 // Initialize Discord Client
@@ -124,149 +222,36 @@ client.once(Events.ClientReady, () => {
 
 // Watch for new threads (forum posts are threads)
 client.on('threadCreate', async (thread) => {
-  // Check if thread belongs to the configured server (guild)
-  if (DISCORD_SERVER_ID && thread.guildId !== DISCORD_SERVER_ID) {
+  // Filter by server
+  if (DISCORD_SERVER_ID && thread.guildId !== DISCORD_SERVER_ID) return;
+
+  // Filter by channel
+  if (!DISCORD_CHANNEL_IDS.includes(thread.parentId)) return;
+
+  console.log(`New forum post detected: "${thread.name}" (ID: ${thread.id})`);
+
+  // Fetch the starter message immediately (with retries)
+  const starterMessage = await fetchStarterMessageWithRetry(thread);
+  if (!starterMessage) {
+    console.error(`Could not fetch starter message for thread "${thread.name}". Skipping.`);
     return;
   }
 
-  // Check if the thread is created in one of the watched forum channels
-  if (!DISCORD_CHANNEL_IDS.includes(thread.parentId)) {
+  // Collect image attachments
+  const imageAttachments = starterMessage.attachments.filter(a => (a.contentType || '').startsWith('image/'));
+
+  if (imageAttachments.size === 0) {
+    console.log(`No images in thread "${thread.name}". Skipping.`);
     return;
   }
 
-  console.log(`New forum post detected: "${thread.name}" (ID: ${thread.id}) in parent channel ${thread.parentId}`);
+  console.log(`Found ${imageAttachments.size} image(s) in thread "${thread.name}".`);
 
-  // Enqueue the processing of the thread
-  taggerQueue.enqueue(async () => {
-    let typingInterval = null;
-    try {
-      console.log(`Processing thread "${thread.name}"...`);
+  // Fire rename immediately (does not wait for the Ollama queue)
+  renameThreadWithId(thread, imageAttachments);
 
-      // Start typing indicator and refresh it every 5 seconds
-      await thread.sendTyping().catch(err => console.warn(`Failed to send initial typing indicator: ${err.message}`));
-      typingInterval = setInterval(() => {
-        thread.sendTyping().catch(err => console.warn(`Failed to send typing indicator: ${err.message}`));
-      }, 5000);
-
-      // Discord forum threads might not have the starter message populated instantly.
-      // We will attempt to fetch it with retries.
-      let starterMessage = null;
-      for (let attempt = 1; attempt <= 5; attempt++) {
-        try {
-          starterMessage = await thread.fetchStarterMessage();
-          if (starterMessage) break;
-        } catch (err) {
-          console.log(`[Attempt ${attempt}/5] Failed to fetch starter message: ${err.message}`);
-        }
-        await new Promise(resolve => setTimeout(resolve, 2000));
-      }
-
-      if (!starterMessage) {
-        console.error(`Could not fetch starter message for thread "${thread.name}". Skipping.`);
-        return;
-      }
-
-      // Find image attachments
-      const imageAttachments = starterMessage.attachments.filter(attachment => {
-        const contentType = attachment.contentType || '';
-        return contentType.startsWith('image/');
-      });
-
-      if (imageAttachments.size === 0) {
-        console.log(`No images found in starter message for thread "${thread.name}". Skipping.`);
-        return;
-      }
-
-      console.log(`Found ${imageAttachments.size} image(s) in thread "${thread.name}". Describing...`);
-
-      // Detect a numeric image ID from any attachment filename and rename the thread
-      // (done before Ollama query so the rename succeeds even if Ollama is down)
-      let detectedId = null;
-      for (const [_, attachment] of imageAttachments) {
-        detectedId = extractImageId(attachment.name);
-        if (detectedId) break;
-      }
-
-      if (detectedId) {
-        const originalTitle = thread.name;
-        const newTitle = `${detectedId} - ${originalTitle}`;
-        console.log(`Renaming thread to: "${newTitle}"`);
-        await thread.setName(newTitle);
-
-        // Discord posts a system message when the thread name changes.
-        // Fetch recent messages and delete any that are the name-change notification.
-        try {
-          const recentMessages = await thread.messages.fetch({ limit: 10 });
-          for (const [, msg] of recentMessages) {
-            if (msg.system && msg.type === 11 /* ChannelNameChange */) {
-              await msg.delete();
-              console.log('Deleted thread name-change system notification.');
-              break;
-            }
-          }
-        } catch (cleanupErr) {
-          console.warn('Could not delete thread name-change notification:', cleanupErr.message);
-        }
-      }
-
-      // Convert images to base64 strings
-      const base64Images = [];
-      for (const [_, attachment] of imageAttachments) {
-        try {
-          const res = await fetch(attachment.url);
-          if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
-          const buffer = await res.arrayBuffer();
-          const base64 = Buffer.from(buffer).toString('base64');
-          base64Images.push(base64);
-        } catch (err) {
-          console.error(`Failed to download image ${attachment.name}:`, err.message);
-        }
-      }
-
-      if (base64Images.length === 0) {
-        console.error(`Failed to download any images for thread "${thread.name}". Skipping.`);
-        return;
-      }
-
-      // Query Ollama
-      console.log(`Sending image(s) to Ollama API at ${OLLAMA_BASE_URL} (Model: ${OLLAMA_MODEL})...`);
-      const ollamaResponse = await fetch(`${OLLAMA_BASE_URL}/api/generate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: OLLAMA_MODEL,
-          prompt: OLLAMA_PROMPT,
-          images: base64Images,
-          stream: false,
-          keep_alive: 0,
-        }),
-      });
-
-      if (!ollamaResponse.ok) {
-        throw new Error(`Ollama API returned HTTP ${ollamaResponse.status}`);
-      }
-
-      const responseData = await ollamaResponse.json();
-      const description = responseData.response;
-
-      if (!description) {
-        throw new Error("Empty description returned from Ollama API");
-      }
-
-      // Post the response back to the forum thread, split into chunks of max 1800 chars
-      const messageChunks = splitMessage(description, 1800);
-      for (const chunk of messageChunks) {
-        await thread.send(chunk);
-      }
-      console.log(`Successfully replied to thread "${thread.name}" with Ollama description (${messageChunks.length} message(s)).`);
-    } catch (error) {
-      console.error(`Error processing thread "${thread.name}":`, error);
-    } finally {
-      if (typingInterval) {
-        clearInterval(typingInterval);
-      }
-    }
-  });
+  // Queue Ollama processing — starts right away if nothing else is in queue
+  taggerQueue.enqueue(() => describeAndReply(thread, imageAttachments));
 });
 
 client.login(DISCORD_BOT_TOKEN);
