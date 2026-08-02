@@ -5,6 +5,7 @@ dotenv.config();
 
 // Validate Environment Variables
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
+const DISCORD_SERVER_ID = process.env.DISCORD_SERVER_ID;
 const DISCORD_CHANNEL_IDS = process.env.DISCORD_CHANNEL_IDS 
   ? process.env.DISCORD_CHANNEL_IDS.split(',').map(id => id.trim()) 
   : [];
@@ -22,6 +23,9 @@ if (DISCORD_CHANNEL_IDS.length === 0) {
 }
 
 console.log("Starting Discord Forum Image Tagger Bot...");
+if (DISCORD_SERVER_ID) {
+  console.log(`Watching Server (Guild) ID: ${DISCORD_SERVER_ID}`);
+}
 console.log(`Watching Channel IDs: ${DISCORD_CHANNEL_IDS.join(', ')}`);
 console.log(`Ollama Base URL: ${OLLAMA_BASE_URL}`);
 console.log(`Ollama Model: ${OLLAMA_MODEL}`);
@@ -75,6 +79,11 @@ client.once('ready', () => {
 
 // Watch for new threads (forum posts are threads)
 client.on('threadCreate', async (thread) => {
+  // Check if thread belongs to the configured server (guild)
+  if (DISCORD_SERVER_ID && thread.guildId !== DISCORD_SERVER_ID) {
+    return;
+  }
+
   // Check if the thread is created in one of the watched forum channels
   if (!DISCORD_CHANNEL_IDS.includes(thread.parentId)) {
     return;

@@ -15,6 +15,7 @@ ENV OLLAMA_BASE_URL=http://localhost:11434
 ENV OLLAMA_MODEL=llava
 ENV OLLAMA_PROMPT="Describe this image in bullet points."
 ENV DISCORD_BOT_TOKEN=""
+ENV DISCORD_SERVER_ID=""
 ENV DISCORD_CHANNEL_IDS=""
 
 # Run the app
