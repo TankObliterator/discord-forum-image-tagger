@@ -168,29 +168,45 @@ async function describeAndReply(thread, imageAttachments) {
       return;
     }
 
-    // Query Ollama
-    console.log(`Sending ${base64Images.length} image(s) to Ollama (${OLLAMA_MODEL})...`);
-    const ollamaResponse = await fetch(`${OLLAMA_BASE_URL}/api/generate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: OLLAMA_MODEL,
-        prompt: OLLAMA_PROMPT,
-        images: base64Images,
-        stream: false,
-        keep_alive: 0,
-      }),
-    });
+    // Query Ollama with up to 3 attempts
+    const MAX_OLLAMA_ATTEMPTS = 3;
+    let description = null;
+    for (let attempt = 1; attempt <= MAX_OLLAMA_ATTEMPTS; attempt++) {
+      console.log(`Sending ${base64Images.length} image(s) to Ollama (${OLLAMA_MODEL})... [attempt ${attempt}/${MAX_OLLAMA_ATTEMPTS}]`);
+      try {
+        const ollamaResponse = await fetch(`${OLLAMA_BASE_URL}/api/generate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: OLLAMA_MODEL,
+            prompt: OLLAMA_PROMPT,
+            images: base64Images,
+            stream: false,
+            keep_alive: 0,
+          }),
+        });
 
-    if (!ollamaResponse.ok) {
-      throw new Error(`Ollama API returned HTTP ${ollamaResponse.status}`);
+        if (!ollamaResponse.ok) {
+          throw new Error(`Ollama API returned HTTP ${ollamaResponse.status}`);
+        }
+
+        const responseData = await ollamaResponse.json();
+        if (!responseData.response) {
+          throw new Error("Empty description returned from Ollama API");
+        }
+
+        description = responseData.response;
+        break; // success — exit retry loop
+      } catch (err) {
+        console.warn(`Ollama attempt ${attempt}/${MAX_OLLAMA_ATTEMPTS} failed for thread "${thread.name}": ${err.message}`);
+        if (attempt < MAX_OLLAMA_ATTEMPTS) {
+          await new Promise(resolve => setTimeout(resolve, 3000));
+        }
+      }
     }
 
-    const responseData = await ollamaResponse.json();
-    const description = responseData.response;
-
     if (!description) {
-      throw new Error("Empty description returned from Ollama API");
+      throw new Error(`Ollama failed to return a description after ${MAX_OLLAMA_ATTEMPTS} attempts.`);
     }
 
     // Post description back to the forum thread, split into ≤1800-char chunks
