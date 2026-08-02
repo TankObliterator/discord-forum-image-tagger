@@ -1,0 +1,33 @@
+name: Build Docker Image
+
+on:
+  push:
+    paths-ignore:
+      - 'README.md'
+      - 'readme.md'
+  pull_request:
+    paths-ignore:
+      - 'README.md'
+      - 'readme.md'
+
+jobs:
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          tags: discord-forum-image-tagger:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
