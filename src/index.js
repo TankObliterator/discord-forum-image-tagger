@@ -10,8 +10,8 @@ const DISCORD_CHANNEL_IDS = process.env.DISCORD_CHANNEL_IDS
   ? process.env.DISCORD_CHANNEL_IDS.split(',').map(id => id.trim()) 
   : [];
 const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || 'http://localhost:11434';
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'llava';
-const OLLAMA_PROMPT = process.env.OLLAMA_PROMPT || 'Describe this image in bullet points.';
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'qwen3-vl:2b';
+const OLLAMA_PROMPT = process.env.OLLAMA_PROMPT || "What's in this image?";
 
 if (!DISCORD_BOT_TOKEN) {
   console.error("ERROR: DISCORD_BOT_TOKEN is required.");
@@ -198,6 +198,7 @@ client.on('threadCreate', async (thread) => {
           prompt: OLLAMA_PROMPT,
           images: base64Images,
           stream: false,
+          keep_alive: 0,
         }),
       });
 
