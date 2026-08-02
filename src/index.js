@@ -179,6 +179,36 @@ client.on('threadCreate', async (thread) => {
 
       console.log(`Found ${imageAttachments.size} image(s) in thread "${thread.name}". Describing...`);
 
+      // Detect a numeric image ID from any attachment filename and rename the thread
+      // (done before Ollama query so the rename succeeds even if Ollama is down)
+      let detectedId = null;
+      for (const [_, attachment] of imageAttachments) {
+        detectedId = extractImageId(attachment.name);
+        if (detectedId) break;
+      }
+
+      if (detectedId) {
+        const originalTitle = thread.name;
+        const newTitle = `${detectedId} - ${originalTitle}`;
+        console.log(`Renaming thread to: "${newTitle}"`);
+        await thread.setName(newTitle);
+
+        // Discord posts a system message when the thread name changes.
+        // Fetch recent messages and delete any that are the name-change notification.
+        try {
+          const recentMessages = await thread.messages.fetch({ limit: 10 });
+          for (const [, msg] of recentMessages) {
+            if (msg.system && msg.type === 11 /* ChannelNameChange */) {
+              await msg.delete();
+              console.log('Deleted thread name-change system notification.');
+              break;
+            }
+          }
+        } catch (cleanupErr) {
+          console.warn('Could not delete thread name-change notification:', cleanupErr.message);
+        }
+      }
+
       // Convert images to base64 strings
       const base64Images = [];
       for (const [_, attachment] of imageAttachments) {
@@ -229,35 +259,6 @@ client.on('threadCreate', async (thread) => {
         await thread.send(chunk);
       }
       console.log(`Successfully replied to thread "${thread.name}" with Ollama description (${messageChunks.length} message(s)).`);
-
-      // Detect a numeric image ID from any attachment filename and rename the thread
-      let detectedId = null;
-      for (const [_, attachment] of imageAttachments) {
-        detectedId = extractImageId(attachment.name);
-        if (detectedId) break;
-      }
-
-      if (detectedId) {
-        const originalTitle = thread.name;
-        const newTitle = `${detectedId} - ${originalTitle}`;
-        console.log(`Renaming thread to: "${newTitle}"`);
-        await thread.setName(newTitle);
-
-        // Discord posts a system message when the thread name changes.
-        // Fetch recent messages and delete any that are the name-change notification.
-        try {
-          const recentMessages = await thread.messages.fetch({ limit: 10 });
-          for (const [, msg] of recentMessages) {
-            if (msg.system && msg.type === 11 /* ChannelNameChange */) {
-              await msg.delete();
-              console.log('Deleted thread name-change system notification.');
-              break;
-            }
-          }
-        } catch (cleanupErr) {
-          console.warn('Could not delete thread name-change notification:', cleanupErr.message);
-        }
-      }
     } catch (error) {
       console.error(`Error processing thread "${thread.name}":`, error);
     } finally {
