@@ -1,4 +1,4 @@
-import { Client, GatewayIntentBits } from 'discord.js';
+import { Client, GatewayIntentBits, Events } from 'discord.js';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -73,7 +73,7 @@ const client = new Client({
   ],
 });
 
-client.once('ready', () => {
+client.once(Events.ClientReady, () => {
   console.log(`Bot logged in as ${client.user.tag}`);
 });
 
@@ -93,8 +93,15 @@ client.on('threadCreate', async (thread) => {
 
   // Enqueue the processing of the thread
   taggerQueue.enqueue(async () => {
+    let typingInterval = null;
     try {
       console.log(`Processing thread "${thread.name}"...`);
+
+      // Start typing indicator and refresh it every 5 seconds
+      await thread.sendTyping().catch(err => console.warn(`Failed to send initial typing indicator: ${err.message}`));
+      typingInterval = setInterval(() => {
+        thread.sendTyping().catch(err => console.warn(`Failed to send typing indicator: ${err.message}`));
+      }, 5000);
 
       // Discord forum threads might not have the starter message populated instantly.
       // We will attempt to fetch it with retries.
@@ -175,6 +182,10 @@ client.on('threadCreate', async (thread) => {
       console.log(`Successfully replied to thread "${thread.name}" with Ollama description.`);
     } catch (error) {
       console.error(`Error processing thread "${thread.name}":`, error);
+    } finally {
+      if (typingInterval) {
+        clearInterval(typingInterval);
+      }
     }
   });
 });
