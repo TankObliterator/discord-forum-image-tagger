@@ -64,6 +64,41 @@ class TaskQueue {
 
 const taggerQueue = new TaskQueue();
 
+// Helper function to split long messages into chunks under 1800 characters
+function splitMessage(text, maxLength = 1800) {
+  if (text.length <= maxLength) return [text];
+  const chunks = [];
+  let currentChunk = '';
+  const lines = text.split('\n');
+  
+  for (const line of lines) {
+    if (currentChunk.length + line.length + 1 > maxLength) {
+      if (currentChunk) {
+        chunks.push(currentChunk);
+        currentChunk = '';
+      }
+      if (line.length > maxLength) {
+        let remaining = line;
+        while (remaining.length > maxLength) {
+          chunks.push(remaining.substring(0, maxLength));
+          remaining = remaining.substring(maxLength);
+        }
+        currentChunk = remaining;
+      } else {
+        currentChunk = line;
+      }
+    } else {
+      currentChunk = currentChunk ? currentChunk + '\n' + line : line;
+    }
+  }
+  
+  if (currentChunk) {
+    chunks.push(currentChunk);
+  }
+  return chunks;
+}
+
+
 // Initialize Discord Client
 const client = new Client({
   intents: [
@@ -177,9 +212,12 @@ client.on('threadCreate', async (thread) => {
         throw new Error("Empty description returned from Ollama API");
       }
 
-      // Post the response back to the forum thread
-      await thread.send(description);
-      console.log(`Successfully replied to thread "${thread.name}" with Ollama description.`);
+      // Post the response back to the forum thread, split into chunks of max 1800 chars
+      const messageChunks = splitMessage(description, 1800);
+      for (const chunk of messageChunks) {
+        await thread.send(chunk);
+      }
+      console.log(`Successfully replied to thread "${thread.name}" with Ollama description (${messageChunks.length} message(s)).`);
     } catch (error) {
       console.error(`Error processing thread "${thread.name}":`, error);
     } finally {
