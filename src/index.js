@@ -272,7 +272,8 @@ async function generateWithRetry({ model, system, prompt = '', images, retries, 
 }
 
 // Run the multimodal image-description -> text-tagging pipeline and post the tags.
-async function describeAndReply(thread, imageAttachments, stopTyping) {
+async function describeAndReply(thread, imageAttachments) {
+  const stopTyping = await startTypingIndicator(thread);
   try {
     const base64Images = [];
     for (const [_, attachment] of imageAttachments) {
@@ -293,7 +294,7 @@ async function describeAndReply(thread, imageAttachments, stopTyping) {
 
     const description = await generateWithRetry({
       model: OLLAMA_IMAGE_MODEL,
-      system: OLLAMA_IMAGE_PROMPT,
+      prompt: `${OLLAMA_IMAGE_PROMPT}\n\nDescribe the attached image.`,
       images: base64Images,
       retries: OLLAMA_IMAGE_RETRIES,
       thread,
@@ -363,15 +364,11 @@ client.on('threadCreate', async (thread) => {
 
   console.log(`Found ${imageAttachments.size} image(s) in thread "${thread.name}".`);
 
-  // Start typing before title inspection/rename so Discord does not show a gap while work continues.
-  const stopTyping = await startTypingIndicator(thread);
-
   // Rename after inspecting image dimensions, then queue Ollama processing.
   await renameThreadWithId(thread, imageAttachments);
-  await thread.sendTyping().catch(err => console.warn(`Failed to refresh typing indicator after rename: ${err.message}`));
 
-  // Queue Ollama processing — starts right away if nothing else is in queue
-  taggerQueue.enqueue(() => describeAndReply(thread, imageAttachments, stopTyping));
+  // Start typing only when this task reaches the front of the queue and begins AI processing.
+  taggerQueue.enqueue(() => describeAndReply(thread, imageAttachments));
 });
 
 client.login(DISCORD_BOT_TOKEN);
