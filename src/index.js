@@ -106,6 +106,46 @@ function extractImageId(filename) {
   return match ? match[1] : null;
 }
 
+// Read image dimensions from common image formats without decoding the full image.
+function getImageDimensions(buffer) {
+  if (buffer.length >= 24 && buffer.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
+    return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
+  }
+
+  if (buffer.length >= 10 && (buffer.subarray(0, 6).toString() === 'GIF87a' || buffer.subarray(0, 6).toString() === 'GIF89a')) {
+    return { width: buffer.readUInt16LE(6), height: buffer.readUInt16LE(8) };
+  }
+
+  if (buffer.length >= 30 && buffer.subarray(0, 4).toString() === 'RIFF' && buffer.subarray(8, 12).toString() === 'WEBP') {
+    const type = buffer.subarray(12, 16).toString();
+    if (type === 'VP8X' && buffer.length >= 30) {
+      return {
+        width: 1 + buffer.readUIntLE(24, 3),
+        height: 1 + buffer.readUIntLE(27, 3),
+      };
+    }
+  }
+
+  if (buffer.length >= 2 && buffer.readUInt16BE(0) === 0xffd8) {
+    let offset = 2;
+    while (offset + 9 < buffer.length) {
+      if (buffer[offset] !== 0xff) {
+        offset++;
+        continue;
+      }
+      const marker = buffer[offset + 1];
+      const segmentLength = buffer.readUInt16BE(offset + 2);
+      if ((marker >= 0xc0 && marker <= 0xc3) || (marker >= 0xc5 && marker <= 0xc7) ||
+          (marker >= 0xc9 && marker <= 0xcb) || (marker >= 0xcd && marker <= 0xcf)) {
+        return { height: buffer.readUInt16BE(offset + 5), width: buffer.readUInt16BE(offset + 7) };
+      }
+      offset += 2 + segmentLength;
+    }
+  }
+
+  return null;
+}
+
 // Helper: fetch the starter message for a thread, retrying up to 5 times
 async function fetchStarterMessageWithRetry(thread) {
   for (let attempt = 1; attempt <= 5; attempt++) {
@@ -120,7 +160,7 @@ async function fetchStarterMessageWithRetry(thread) {
   return null;
 }
 
-// Immediately rename a thread if an image ID is detected in any attachment filename
+// Rename a thread using the detected ID and dimensions from its image attachments.
 async function renameThreadWithId(thread, imageAttachments) {
   let detectedId = null;
   for (const [_, attachment] of imageAttachments) {
@@ -130,8 +170,32 @@ async function renameThreadWithId(thread, imageAttachments) {
 
   if (!detectedId) return;
 
+  const dimensions = [];
+  for (const [_, attachment] of imageAttachments) {
+    try {
+      const response = await fetch(attachment.url);
+      if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+      const imageBuffer = Buffer.from(await response.arrayBuffer());
+      const size = getImageDimensions(imageBuffer);
+      if (size) {
+        dimensions.push(size);
+        console.log(`Image ${attachment.name}: ${size.width}x${size.height} (${size.width * size.height} pixels)`);
+      } else {
+        console.warn(`Could not determine dimensions for image ${attachment.name}.`);
+      }
+    } catch (err) {
+      console.warn(`Failed to inspect image ${attachment.name}: ${err.message}`);
+    }
+  }
+
   const originalTitle = thread.name;
-  const newTitle = `${detectedId} - ${originalTitle}`;
+  const firstImage = dimensions[0];
+  const mapSize = firstImage && firstImage.width % 128 === 0 && firstImage.height % 128 === 0
+    ? `${firstImage.width / 128}x${firstImage.height / 128}`
+    : null;
+  const newTitle = mapSize
+    ? `${detectedId} | ${mapSize} | ${originalTitle}`
+    : `${detectedId} | ${originalTitle}`;
   console.log(`Renaming thread to: "${newTitle}"`);
   try {
     await thread.setName(newTitle);
@@ -263,8 +327,8 @@ client.on('threadCreate', async (thread) => {
 
   console.log(`Found ${imageAttachments.size} image(s) in thread "${thread.name}".`);
 
-  // Fire rename immediately (does not wait for the Ollama queue)
-  renameThreadWithId(thread, imageAttachments);
+  // Rename after inspecting image dimensions, then queue Ollama processing.
+  await renameThreadWithId(thread, imageAttachments);
 
   // Queue Ollama processing — starts right away if nothing else is in queue
   taggerQueue.enqueue(() => describeAndReply(thread, imageAttachments));
