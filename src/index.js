@@ -10,8 +10,17 @@ const DISCORD_CHANNEL_IDS = process.env.DISCORD_CHANNEL_IDS
   ? process.env.DISCORD_CHANNEL_IDS.split(',').map(id => id.trim()) 
   : [];
 const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || 'http://localhost:11434';
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'qwen3-vl:2b';
-const OLLAMA_PROMPT = process.env.OLLAMA_PROMPT || "What's in this image?";
+const OLLAMA_TEXT_MODEL = process.env.OLLAMA_TEXT_MODEL || 'qwen2.5:3b';
+const OLLAMA_TEXT_PROMPT = process.env.OLLAMA_TEXT_PROMPT || 'Take this image description and reduce it to a list of tag words separated by commas.';
+const OLLAMA_TEXT_RETRIES = parseRetryCount(process.env.OLLAMA_TEXT_RETRIES, 3);
+const OLLAMA_IMAGE_MODEL = process.env.OLLAMA_IMAGE_MODEL || 'qwen3-vl:2b';
+const OLLAMA_IMAGE_PROMPT = process.env.OLLAMA_IMAGE_PROMPT || 'Describe this image with as much detail as possible. Leave nothing out.';
+const OLLAMA_IMAGE_RETRIES = parseRetryCount(process.env.OLLAMA_IMAGE_RETRIES, 3);
+
+function parseRetryCount(value, fallback) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
 
 if (!DISCORD_BOT_TOKEN) {
   console.error("ERROR: DISCORD_BOT_TOKEN is required.");
@@ -28,8 +37,10 @@ if (DISCORD_SERVER_ID) {
 }
 console.log(`Watching Channel IDs: ${DISCORD_CHANNEL_IDS.join(', ')}`);
 console.log(`Ollama Base URL: ${OLLAMA_BASE_URL}`);
-console.log(`Ollama Model: ${OLLAMA_MODEL}`);
-console.log(`Ollama Prompt: ${OLLAMA_PROMPT}`);
+console.log(`Ollama Image Model: ${OLLAMA_IMAGE_MODEL}`);
+console.log(`Ollama Image Retries: ${OLLAMA_IMAGE_RETRIES}`);
+console.log(`Ollama Text Model: ${OLLAMA_TEXT_MODEL}`);
+console.log(`Ollama Text Retries: ${OLLAMA_TEXT_RETRIES}`);
 
 // In-Memory Queue for Ollama requests (sequential to avoid concurrent GPU thrashing)
 class TaskQueue {
@@ -204,17 +215,65 @@ async function renameThreadWithId(thread, imageAttachments) {
   }
 }
 
-// Run Ollama image description and post results to the thread
-async function describeAndReply(thread, imageAttachments) {
+async function startTypingIndicator(thread) {
+  let stopped = false;
   let typingInterval = null;
-  try {
-    // Start typing indicator and keep it alive during the Ollama request
-    await thread.sendTyping().catch(err => console.warn(`Failed to send typing indicator: ${err.message}`));
-    typingInterval = setInterval(() => {
-      thread.sendTyping().catch(err => console.warn(`Failed to send typing indicator: ${err.message}`));
-    }, 5000);
 
-    // Convert images to base64
+  const sendTyping = () => {
+    if (stopped) return;
+    thread.sendTyping().catch(err => console.warn(`Failed to send typing indicator: ${err.message}`));
+  };
+
+  await thread.sendTyping().catch(err => console.warn(`Failed to send typing indicator: ${err.message}`));
+  typingInterval = setInterval(sendTyping, 2000);
+
+  return () => {
+    stopped = true;
+    clearInterval(typingInterval);
+  };
+}
+
+async function generateWithRetry({ model, system, prompt = '', images, retries, thread }) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    console.log(`Sending request to Ollama (${model})... [attempt ${attempt}/${retries}]`);
+    try {
+      const ollamaResponse = await fetch(`${OLLAMA_BASE_URL}/api/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model,
+          system,
+          prompt,
+          ...(images ? { images } : {}),
+          stream: false,
+          keep_alive: 0,
+        }),
+      });
+
+      if (!ollamaResponse.ok) {
+        throw new Error(`Ollama API returned HTTP ${ollamaResponse.status}`);
+      }
+
+      const responseData = await ollamaResponse.json();
+      if (!responseData.response) {
+        throw new Error('Empty response returned from Ollama API');
+      }
+
+      return responseData.response.trim();
+    } catch (err) {
+      console.warn(`Ollama attempt ${attempt}/${retries} failed for thread "${thread.name}": ${err.message}`);
+      if (attempt < retries) {
+        await new Promise(resolve => setTimeout(resolve, 3000));
+      }
+    }
+  }
+
+  throw new Error(`Ollama failed after ${retries} attempts.`);
+}
+
+// Run the multimodal image-description -> text-tagging pipeline and post the tags.
+async function describeAndReply(thread, imageAttachments, stopTyping) {
+  try {
     const base64Images = [];
     for (const [_, attachment] of imageAttachments) {
       try {
@@ -232,49 +291,26 @@ async function describeAndReply(thread, imageAttachments) {
       return;
     }
 
-    // Query Ollama with up to 3 attempts
-    const MAX_OLLAMA_ATTEMPTS = 3;
-    let description = null;
-    for (let attempt = 1; attempt <= MAX_OLLAMA_ATTEMPTS; attempt++) {
-      console.log(`Sending ${base64Images.length} image(s) to Ollama (${OLLAMA_MODEL})... [attempt ${attempt}/${MAX_OLLAMA_ATTEMPTS}]`);
-      try {
-        const ollamaResponse = await fetch(`${OLLAMA_BASE_URL}/api/generate`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model: OLLAMA_MODEL,
-            prompt: OLLAMA_PROMPT,
-            images: base64Images,
-            stream: false,
-            keep_alive: 0,
-          }),
-        });
+    const description = await generateWithRetry({
+      model: OLLAMA_IMAGE_MODEL,
+      system: OLLAMA_IMAGE_PROMPT,
+      images: base64Images,
+      retries: OLLAMA_IMAGE_RETRIES,
+      thread,
+    });
 
-        if (!ollamaResponse.ok) {
-          throw new Error(`Ollama API returned HTTP ${ollamaResponse.status}`);
-        }
+    // The vision request uses keep_alive: 0. Give Ollama a moment to unload it before loading the text model.
+    await new Promise(resolve => setTimeout(resolve, 1000));
 
-        const responseData = await ollamaResponse.json();
-        if (!responseData.response) {
-          throw new Error("Empty description returned from Ollama API");
-        }
+    const tags = await generateWithRetry({
+      model: OLLAMA_TEXT_MODEL,
+      system: OLLAMA_TEXT_PROMPT,
+      prompt: `Image description:\n${description}`,
+      retries: OLLAMA_TEXT_RETRIES,
+      thread,
+    });
 
-        description = responseData.response;
-        break; // success — exit retry loop
-      } catch (err) {
-        console.warn(`Ollama attempt ${attempt}/${MAX_OLLAMA_ATTEMPTS} failed for thread "${thread.name}": ${err.message}`);
-        if (attempt < MAX_OLLAMA_ATTEMPTS) {
-          await new Promise(resolve => setTimeout(resolve, 3000));
-        }
-      }
-    }
-
-    if (!description) {
-      throw new Error(`Ollama failed to return a description after ${MAX_OLLAMA_ATTEMPTS} attempts.`);
-    }
-
-    // Post description back to the forum thread, split into ≤1800-char chunks
-    const messageChunks = splitMessage(description, 1800);
+    const messageChunks = splitMessage(tags, 1800);
     for (const chunk of messageChunks) {
       await thread.send(chunk);
     }
@@ -282,7 +318,7 @@ async function describeAndReply(thread, imageAttachments) {
   } catch (error) {
     console.error(`Error describing images in thread "${thread.name}":`, error);
   } finally {
-    if (typingInterval) clearInterval(typingInterval);
+    stopTyping();
   }
 }
 
@@ -327,11 +363,15 @@ client.on('threadCreate', async (thread) => {
 
   console.log(`Found ${imageAttachments.size} image(s) in thread "${thread.name}".`);
 
+  // Start typing before title inspection/rename so Discord does not show a gap while work continues.
+  const stopTyping = await startTypingIndicator(thread);
+
   // Rename after inspecting image dimensions, then queue Ollama processing.
   await renameThreadWithId(thread, imageAttachments);
+  await thread.sendTyping().catch(err => console.warn(`Failed to refresh typing indicator after rename: ${err.message}`));
 
   // Queue Ollama processing — starts right away if nothing else is in queue
-  taggerQueue.enqueue(() => describeAndReply(thread, imageAttachments));
+  taggerQueue.enqueue(() => describeAndReply(thread, imageAttachments, stopTyping));
 });
 
 client.login(DISCORD_BOT_TOKEN);
